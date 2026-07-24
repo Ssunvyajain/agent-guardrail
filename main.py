@@ -9,6 +9,7 @@ app = FastAPI()
 
 
 WRITE_ROOT = "/data/agent/outbox"
+WORKSPACE = "/home/agent/workspace"
 
 ALLOWED_HOSTS = {
     "pypi.org",
@@ -18,20 +19,23 @@ ALLOWED_HOSTS = {
 
 def normalize_path(path):
 
-    if not os.path.isabs(path):
-        path = os.path.join(
-            WRITE_ROOT,
+    # Absolute path
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+
+    # Relative paths come from agent workspace
+    return os.path.normpath(
+        os.path.join(
+            WORKSPACE,
             path
         )
-
-    return os.path.abspath(path)
-
+    )
 
 
 def inside(path, root):
 
-    path = os.path.abspath(path)
-    root = os.path.abspath(root)
+    path = os.path.normpath(path)
+    root = os.path.normpath(root)
 
     return (
         path == root
@@ -39,61 +43,53 @@ def inside(path, root):
     )
 
 
-
 def looks_like_secret(command):
 
-    command_lower = command.lower()
+    c = command.lower()
+
+    # remove spaces to catch split tricks
+    compact = c.replace(" ", "")
 
 
-    # Direct secret file references
-    blocked_patterns = [
+    direct_patterns = [
         "/home/agent/.bashrc",
         "~/.bashrc",
         "$home/.bashrc",
-        "${home}/.bashrc"
+        "${home}/.bashrc",
+        "$env:home\\.bashrc",
+        "bashrc"
     ]
 
 
-    for pattern in blocked_patterns:
-        if pattern in command_lower:
+    for p in direct_patterns:
+
+        if p in c or p in compact:
             return True
 
 
-    # Detect base64 encoded commands
+    # Try decoding base64 parts
     for word in command.split():
 
         try:
+
             decoded = base64.b64decode(
-                word
+                word + "===",
+                validate=False
             ).decode(
                 errors="ignore"
             ).lower()
 
 
-            if "/home/agent/.bashrc" in decoded:
+            if ".bashrc" in decoded:
                 return True
 
-            if "~/.bashrc" in decoded:
-                return True
 
-            if "$home/.bashrc" in decoded:
+            if "/home/agent" in decoded and "bash" in decoded:
                 return True
 
 
         except Exception:
             pass
-
-
-    # Detect common shell tricks
-    tricks = [
-        "cat $home",
-        "cat ${home}",
-        "cat ~/.bashrc"
-    ]
-
-    for trick in tricks:
-        if trick in command_lower:
-            return True
 
 
     return False
@@ -108,7 +104,9 @@ async def check(request: Request):
     tool = data.get("tool")
 
 
+    # --------------------
     # Bash policy
+    # --------------------
     if tool == "bash":
 
         command = data.get(
@@ -132,7 +130,9 @@ async def check(request: Request):
 
 
 
+    # --------------------
     # Write policy
+    # --------------------
     if tool == "write_file":
 
         path = normalize_path(
@@ -161,14 +161,15 @@ async def check(request: Request):
 
 
 
+    # --------------------
     # HTTP policy
+    # --------------------
     if tool == "http_request":
 
         url = data.get(
             "url",
             ""
         )
-
 
         host = urlparse(url).hostname
 
