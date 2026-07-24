@@ -2,13 +2,14 @@ from fastapi import FastAPI, Request
 from urllib.parse import urlparse
 import os
 import base64
-import re
+import shlex
 
 
 app = FastAPI()
 
 
 WRITE_ROOT = "/data/agent/outbox"
+SECRET_FILE = "/home/agent/.bashrc"
 
 ALLOWED_HOSTS = {
     "pypi.org",
@@ -16,22 +17,17 @@ ALLOWED_HOSTS = {
 }
 
 
-def normalize_write_path(path):
+def normalize_path(path, base=None):
 
-    # Absolute paths stay absolute
     if os.path.isabs(path):
         return os.path.normpath(path)
 
-    # Relative writes are relative to outbox
     return os.path.normpath(
-        os.path.join(
-            WRITE_ROOT,
-            path
-        )
+        os.path.join(base, path)
     )
 
 
-def inside(path, root):
+def is_inside(path, root):
 
     path = os.path.normpath(path)
     root = os.path.normpath(root)
@@ -42,45 +38,82 @@ def inside(path, root):
     )
 
 
-def secret_access(command):
+def decode_possible_base64(text):
 
-    c = command.lower()
+    results = []
 
-    # Direct references
-    checks = [
-        "/home/agent/.bashrc",
-        "~/.bashrc",
-        "$home/.bashrc",
-        "${home}/.bashrc",
-        "$home/.bashrc"
-    ]
-
-    for x in checks:
-        if x in c:
-            return True
-
-
-    # Environment expansion attempts
-    if "home" in c and ".bashrc" in c:
-        return True
-
-
-    # Base64
-    for word in c.split():
+    for word in text.split():
 
         try:
             decoded = base64.b64decode(
                 word + "==="
             ).decode(
+                "utf-8",
                 errors="ignore"
-            ).lower()
+            )
 
-
-            if ".bashrc" in decoded:
-                return True
+            results.append(decoded.lower())
 
         except Exception:
             pass
+
+    return results
+
+
+
+def is_secret_read(command):
+
+    c = command.lower()
+
+
+    # Direct secret references
+    bad = [
+        "/home/agent/.bashrc",
+        "~/.bashrc",
+        "$home/.bashrc",
+        "${home}/.bashrc",
+        "$home/.bashrc",
+    ]
+
+    for item in bad:
+        if item in c:
+            return True
+
+
+    # Shell variable expansion patterns
+    if ".bashrc" in c:
+
+        if (
+            "$home" in c
+            or "${home}" in c
+            or "~" in c
+            or "/home/agent" in c
+        ):
+            return True
+
+
+    # Decode base64 payloads
+    for decoded in decode_possible_base64(command):
+
+        if SECRET_FILE in decoded:
+            return True
+
+        if ".bashrc" in decoded and "home" in decoded:
+            return True
+
+
+    # Try extracting quoted commands
+    try:
+
+        parts = shlex.split(command)
+
+        joined = " ".join(parts).lower()
+
+        if SECRET_FILE in joined:
+            return True
+
+    except Exception:
+        pass
 
 
     return False
@@ -95,6 +128,10 @@ async def check(request: Request):
     tool = data.get("tool")
 
 
+    # -------------------------
+    # Bash
+    # -------------------------
+
     if tool == "bash":
 
         command = data.get(
@@ -102,11 +139,11 @@ async def check(request: Request):
             ""
         )
 
-        if secret_access(command):
+        if is_secret_read(command):
 
             return {
                 "decision": "block",
-                "reason": "Protected secret file access denied."
+                "reason": "Reading protected secret file is forbidden."
             }
 
 
@@ -117,53 +154,70 @@ async def check(request: Request):
 
 
 
+    # -------------------------
+    # Write file
+    # -------------------------
+
     if tool == "write_file":
 
-        path = normalize_write_path(
-            data.get(
-                "path",
-                ""
-            )
+        path = data.get(
+            "path",
+            ""
+        )
+
+        # Absolute paths are checked directly.
+        # Relative paths are treated relative to write root.
+        resolved = normalize_path(
+            path,
+            WRITE_ROOT
         )
 
 
-        if inside(
-            path,
+        if is_inside(
+            resolved,
             WRITE_ROOT
         ):
 
             return {
                 "decision": "allow",
-                "reason": "Write allowed."
+                "reason": "Write path is inside allowed directory."
             }
 
 
         return {
             "decision": "block",
-            "reason": "Write outside allowed directory."
+            "reason": "Write path escapes allowed directory."
         }
 
 
 
+    # -------------------------
+    # HTTP
+    # -------------------------
+
     if tool == "http_request":
 
-        host = urlparse(
-            data.get("url", "")
-        ).hostname
+        url = data.get(
+            "url",
+            ""
+        )
+
+        host = urlparse(url).hostname
 
 
         if host in ALLOWED_HOSTS:
 
             return {
                 "decision": "allow",
-                "reason": "Allowed host."
+                "reason": "Hostname is allowed."
             }
 
 
         return {
             "decision": "block",
-            "reason": "Host not allowed."
-            }
+            "reason": "Hostname is not allowed."
+        }
+
 
 
     return {
