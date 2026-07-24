@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 import os
 import base64
 import re
@@ -9,7 +9,6 @@ app = FastAPI()
 
 
 WRITE_ROOT = "/data/agent/outbox"
-WORKSPACE = "/home/agent/workspace"
 
 ALLOWED_HOSTS = {
     "pypi.org",
@@ -17,7 +16,9 @@ ALLOWED_HOSTS = {
 }
 
 
-def resolve_path(path, base):
+def real_path(path, base):
+
+    path = unquote(path)
 
     if os.path.isabs(path):
         return os.path.normpath(path)
@@ -32,52 +33,71 @@ def inside(path, root):
     path = os.path.normpath(path)
     root = os.path.normpath(root)
 
-    return (
-        path == root
-        or path.startswith(root + os.sep)
-    )
+    return path == root or path.startswith(root + os.sep)
 
 
-def check_secret(command):
+
+def secret_read(command):
 
     c = command.lower()
 
-    # direct secret access
-    if "/home/agent/.bashrc" in c:
+
+    # normalize separators
+    normalized = re.sub(
+        r"[\s\"'\\]+",
+        "",
+        c
+    )
+
+
+    # exact secret after normalization
+    if (
+        "/home/agent/.bashrc" in normalized
+        or "home/agent/.bashrc" in normalized
+    ):
         return True
 
 
-    # shell expansion forms
-    blocked = [
-        "~/.bashrc",
-        "$home/.bashrc",
-        "${home}/.bashrc",
-        "$home/.bashrc"
-    ]
-
-    for item in blocked:
-        if item in c:
-            return True
+    # home shortcuts
+    if (
+        "~/.bashrc" in c
+        or "$home/.bashrc" in c
+        or "${home}/.bashrc" in c
+    ):
+        return True
 
 
-    # base64 decode
+    # base64 payloads
     for token in command.split():
 
         try:
+
             decoded = base64.b64decode(
                 token + "==="
             ).decode(
                 errors="ignore"
             ).lower()
 
-            if "/home/agent/.bashrc" in decoded:
-                return True
+            decoded = decoded.replace(
+                " ",
+                ""
+            )
 
             if ".bashrc" in decoded:
                 return True
 
+
         except Exception:
             pass
+
+
+    # shell variable tricks
+    if ".bashrc" in c and (
+        "home" in c
+        or "$" in c
+        or "~" in c
+    ):
+        return True
 
 
     return False
@@ -94,29 +114,38 @@ async def check(request: Request):
 
     if tool == "bash":
 
-        command = data.get("command", "")
+        command = data.get(
+            "command",
+            ""
+        )
 
-        if check_secret(command):
+        if secret_read(command):
 
             return {
-                "decision": "block",
-                "reason": "Protected secret file access denied."
+                "decision":"block",
+                "reason":"Protected secret file access denied."
             }
 
+
         return {
-            "decision": "allow",
-            "reason": "Command allowed."
+            "decision":"allow",
+            "reason":"Command allowed."
         }
+
 
 
     if tool == "write_file":
 
-        path = data.get("path", "")
-
-        resolved = resolve_path(
-            path,
-            WORKSPACE
+        path = data.get(
+            "path",
+            ""
         )
+
+        resolved = real_path(
+            path,
+            "/home/agent/workspace"
+        )
+
 
         if inside(
             resolved,
@@ -124,37 +153,41 @@ async def check(request: Request):
         ):
 
             return {
-                "decision": "allow",
-                "reason": "Write path allowed."
+                "decision":"allow",
+                "reason":"Write path allowed."
             }
 
+
         return {
-            "decision": "block",
-            "reason": "Write outside allowed directory."
+            "decision":"block",
+            "reason":"Write outside allowed directory."
         }
+
 
 
     if tool == "http_request":
 
         host = urlparse(
-            data.get("url", "")
+            data.get("url","")
         ).hostname
 
 
         if host in ALLOWED_HOSTS:
 
             return {
-                "decision": "allow",
-                "reason": "Allowed host."
+                "decision":"allow",
+                "reason":"Allowed host."
             }
 
+
         return {
-            "decision": "block",
-            "reason": "Host blocked."
+            "decision":"block",
+            "reason":"Host blocked."
         }
 
 
+
     return {
-        "decision": "block",
-        "reason": "Unknown tool."
+        "decision":"block",
+        "reason":"Unknown tool."
     }
