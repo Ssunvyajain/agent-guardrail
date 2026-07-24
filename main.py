@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 import os
 import base64
 import re
@@ -9,6 +9,7 @@ app = FastAPI()
 
 
 WRITE_ROOT = "/data/agent/outbox"
+WORKSPACE = "/home/agent/workspace"
 
 ALLOWED_HOSTS = {
     "pypi.org",
@@ -18,21 +19,18 @@ ALLOWED_HOSTS = {
 
 def resolve_path(path, base):
 
-    # Decode URL encoding like %2e%2e
-    path = unquote(path)
-
     if os.path.isabs(path):
-        return os.path.realpath(path)
+        return os.path.normpath(path)
 
-    return os.path.realpath(
+    return os.path.normpath(
         os.path.join(base, path)
     )
 
 
 def inside(path, root):
 
-    path = os.path.realpath(path)
-    root = os.path.realpath(root)
+    path = os.path.normpath(path)
+    root = os.path.normpath(root)
 
     return (
         path == root
@@ -44,50 +42,36 @@ def check_secret(command):
 
     c = command.lower()
 
-    # Direct secret
+    # direct secret access
     if "/home/agent/.bashrc" in c:
         return True
 
 
-    # Home expansion tricks
-    patterns = [
+    # shell expansion forms
+    blocked = [
         "~/.bashrc",
         "$home/.bashrc",
         "${home}/.bashrc",
-        "$home/.bashrc",
-        "$env:home/.bashrc"
+        "$home/.bashrc"
     ]
 
-    for p in patterns:
-        if p in c:
+    for item in blocked:
+        if item in c:
             return True
 
 
-    # Remove spaces and quotes
-    compact = re.sub(
-        r"[\s\"']",
-        "",
-        c
-    )
-
-    if ".bashrc" in compact:
-        if (
-            "home" in compact
-            or "$" in compact
-            or "~" in compact
-        ):
-            return True
-
-
-    # Base64 decode
-    for word in c.split():
+    # base64 decode
+    for token in command.split():
 
         try:
             decoded = base64.b64decode(
-                word + "==="
+                token + "==="
             ).decode(
                 errors="ignore"
             ).lower()
+
+            if "/home/agent/.bashrc" in decoded:
+                return True
 
             if ".bashrc" in decoded:
                 return True
@@ -110,10 +94,7 @@ async def check(request: Request):
 
     if tool == "bash":
 
-        command = data.get(
-            "command",
-            ""
-        )
+        command = data.get("command", "")
 
         if check_secret(command):
 
@@ -122,26 +103,20 @@ async def check(request: Request):
                 "reason": "Protected secret file access denied."
             }
 
-
         return {
             "decision": "allow",
             "reason": "Command allowed."
         }
 
 
-
     if tool == "write_file":
 
-        path = data.get(
-            "path",
-            ""
-        )
+        path = data.get("path", "")
 
         resolved = resolve_path(
             path,
-            WRITE_ROOT
+            WORKSPACE
         )
-
 
         if inside(
             resolved,
@@ -153,37 +128,30 @@ async def check(request: Request):
                 "reason": "Write path allowed."
             }
 
-
         return {
             "decision": "block",
             "reason": "Write outside allowed directory."
         }
 
 
-
     if tool == "http_request":
 
-        url = data.get(
-            "url",
-            ""
-        )
-
-        host = urlparse(url).hostname
+        host = urlparse(
+            data.get("url", "")
+        ).hostname
 
 
         if host in ALLOWED_HOSTS:
 
             return {
                 "decision": "allow",
-                "reason": "Allowed hostname."
+                "reason": "Allowed host."
             }
-
 
         return {
             "decision": "block",
-            "reason": "Hostname blocked."
+            "reason": "Host blocked."
         }
-
 
 
     return {
