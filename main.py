@@ -143,7 +143,7 @@ async def check(request: Request):
 
         resolved = real_path(
             path,
-            "/home/agent/workspace"
+            WRITE_ROOT
         )
 
 
